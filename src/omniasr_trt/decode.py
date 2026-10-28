@@ -66,6 +66,7 @@ class GreedyDecoder:
         self.device = model.final_proj.weight.device
         self.max_batch = max_batch
         self.sync_every = sync_every
+        self.step_tokens = 1  # positions a row advances by at most in one step
         self.use_graphs = graphs and self.device.type == "cuda"
         self.fused = fused and kernels.available(self.device)  # Triton RoPE/KV write and flash-decode attention
         self.fused_prefill = self.fused and os.environ.get("OMNIASR_TRT_FUSED_PREFILL", "1") != "0"
@@ -77,7 +78,7 @@ class GreedyDecoder:
         self.context_floor = CONTEXT_FLOOR
         self.capacity = 0
         self.graphs: dict = {}
-        self.stats = {"steps": 0, "rows_steps": 0, "prefill_tokens": 0, "captures": 0, "grows": 0}
+        self.stats = {"steps": 0, "rows_steps": 0, "tokens": 0, "prefill_tokens": 0, "captures": 0, "grows": 0}
         # Per-slot state (graphs hold these addresses): newest token, its position, finished.
         self.tok = torch.zeros(max_batch, device=self.device, dtype=torch.long)
         self.last = torch.zeros(max_batch, device=self.device, dtype=torch.long)
@@ -222,6 +223,13 @@ class GreedyDecoder:
         tok.copy_(torch.where(running, nxt, tok))
         last.copy_(p)
 
+    def state(self) -> list[Tensor]:
+        """The per-slot buffers a step changes (restored after the warm-up step of a capture)."""
+        return [self.tok, self.last, self.done, self.out]
+
+    def filled(self, slots: list[int], streams: list[int]) -> None:
+        """Called after ``slots`` were prefilled with a context of ``streams`` (subclasses add their state)."""
+
     def runner(self, b: int, keys: int):
         if not self.use_graphs:
             return lambda: self.step(b, keys)
@@ -232,12 +240,12 @@ class GreedyDecoder:
             # illegal memory access on some runs (none without expandable segments or with a synchronisation after
             # every operation). All graphs share one memory pool.
             torch.cuda.synchronize()
-            saved = [t[:b].clone() for t in (self.tok, self.last, self.done, self.out)]
+            saved = [t[:b].clone() for t in self.state()]
             stream = self.capture_stream
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 self.step(b, keys)  # warm-up outside the capture (K/V it writes are rewritten identically)
-                for t, v in zip((self.tok, self.last, self.done, self.out), saved, strict=True):
+                for t, v in zip(self.state(), saved, strict=True):
                     t[:b].copy_(v)
                 graph = torch.cuda.CUDAGraph()
                 graph.capture_begin(pool=self.pool)
@@ -286,7 +294,7 @@ class GreedyDecoder:
             longest = max(c.size(0) for _, _, c in pairs)
             in_flight = [int(self.last[s]) for s in range(b) if stream[s] >= 0 and s not in {p[0] for p in pairs}]
             self.ensure_capacity(max([max(longest, self.context_floor) + self.reserve] +
-                                     [p + self.sync_every + 2 for p in in_flight]))
+                                     [p + self.sync_every * self.step_tokens + 2 for p in in_flight]))
             normal = normal or self.capacity
             slots = [s for s, _, _ in pairs]
             with self.phase("prefill"):
@@ -301,6 +309,7 @@ class GreedyDecoder:
             self.done[idx] = (first == EOS) | (pos >= LIMIT)
             for s, j, c in pairs:
                 stream[s], lens[s], checked[s], stopped[s] = j, c.size(0), c.size(0) - 1, -1
+            self.filled(slots, [j for _, j, _ in pairs])
 
         # Idle slots still run in the step graph (reading no keys) and write at their ``last`` position: reset it, as
         # a previous call may have left positions beyond a cache released since.
@@ -318,6 +327,7 @@ class GreedyDecoder:
                 for s in finished:
                     end = int(stopped[s]) if stopped[s] >= 0 else int(last[s])
                     tokens = [int(t) for t in out[s, lens[s] - 1 : end + 1] if t not in (PAD, BOS, EOS)]
+                    self.stats["tokens"] += end - int(lens[s]) + 2
                     j = int(stream[s])
                     ctx = advance(j, tokens)
                     if ctx is None:
@@ -332,7 +342,7 @@ class GreedyDecoder:
             if (stream < 0).all():
                 break
             last = self.last[:b].cpu().numpy()
-            need = int(last[stream >= 0].max()) + self.sync_every + 2
+            need = int(last[stream >= 0].max()) + self.sync_every * self.step_tokens + 2
             if need > self.capacity:
                 self.ensure_capacity(need + self.reserve)
                 self.check("grow")

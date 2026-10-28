@@ -29,6 +29,7 @@ from torch import Tensor
 from .modeling import HOP, LLMModel, apply_rope, normalize
 
 SEGMENT = 15 * 16000
+DRAFT_MARGIN = (25, 50)  # CTC frames before / after a segment's own in its draft (words across the boundary)
 BOS, PAD, EOS = 0, 1, 2
 MAX_GEN = 8192
 CHECK_EVERY, CHECK_WINDOW, CHECK_RATIO = 250, 100, 4.0
@@ -68,11 +69,25 @@ class Row:
     segments: int
     audio: list = field(default_factory=list)  # per segment: [F, D] embeddings
     tokens: list = field(default_factory=list)  # per segment: list[int]
+    frames: np.ndarray | None = None  # draft: CTC argmax of each 20 ms frame
+
+    def draft(self, i: int) -> tuple[list[int], int] | None:
+        """Segment i's draft (the CTC text of its frames and a margin, blanks and repeats removed) and the draft
+        position where the segment's own frames start."""
+        if self.frames is None:
+            return None
+        lo, hi = i * SEGMENT // HOP, (i + 1) * SEGMENT // HOP
+        ids = self.frames[max(0, lo - DRAFT_MARGIN[0]) : hi + DRAFT_MARGIN[1]]
+        keep = np.ones(len(ids), dtype=bool)
+        keep[1:] = ids[1:] != ids[:-1]
+        keep &= ids > EOS  # blank (0), pad, eos
+        before = int(keep[: lo - max(0, lo - DRAFT_MARGIN[0])].sum())
+        return ids[keep].tolist(), before
 
 
 class LLMTranscriber:
     def __init__(self, model: LLMModel, tokenizer, *, max_batch: int = 8, encoder_batch_seconds: float = 240.0,
-                 reserve: int = 512, beams: int = 1, length_norm: bool = False):
+                 reserve: int = 512, beams: int = 1, length_norm: bool = False, drafter=None, draft_tokens: int = 4):
         self.model = model
         self.tok = tokenizer
         self.langs = lang_table()
@@ -83,6 +98,11 @@ class LLMTranscriber:
         self.reserve = reserve  # decoder KV positions beyond the longest context (grows on demand)
         self.beams, self.length_norm = beams, length_norm  # search defaults (1: greedy)
         self._beam_decoders: dict = {}
+        # Greedy search: ``draft_tokens`` proposed per decoder step (0: one token per step), from the row's own
+        # tokens and the transcript of ``drafter`` (an OmniASRCTC; None: own tokens only).
+        self.drafter = drafter
+        self.draft_tokens = draft_tokens
+        self.last_decoder = None
         v = model.dec_cfg.vocab_size
         self.lid, self.last_seg, self.regular_seg = v, v + 1, v + 2
         self.profile = False  # synchronised wall time per phase in ``timings``
@@ -104,12 +124,14 @@ class LLMTranscriber:
     def lang_id(self, lang: str | None) -> int:
         return 0 if lang is None else self.langs.get(lang.lower(), 0)
 
-    def rows(self, waves, langs) -> list[Row]:
+    def rows(self, waves, langs, drafts=None) -> list[Row]:
         out = []
-        for i, (w, lang) in enumerate(zip(waves, langs, strict=True)):
+        drafts = [None] * len(waves) if drafts is None else drafts
+        for i, (w, lang, d) in enumerate(zip(waves, langs, drafts, strict=True)):
             w = torch.as_tensor(np.asarray(w, dtype=np.float32))
             n = max(1, math.ceil(len(w) / SEGMENT))
-            out.append(Row(i, normalize(w).to(self.device, self.dtype), self.lang_id(lang), n))
+            frames = None if d is None else np.asarray(d.cpu() if isinstance(d, Tensor) else d, dtype=np.int64)
+            out.append(Row(i, normalize(w).to(self.device, self.dtype), self.lang_id(lang), n, frames=frames))
         return out
 
     @torch.inference_mode()
@@ -232,15 +254,21 @@ class LLMTranscriber:
 
     @torch.inference_mode()
     def transcribe(self, waves, langs=None, *, mode: str = "fast", beams: int | None = None,
-                   length_norm: bool | None = None) -> list[str]:
+                   length_norm: bool | None = None, drafts=None) -> list[str]:
         """Texts of 16 kHz mono waves (any length; a last segment needs >= 400 samples, as the reference).
 
         ``beams`` > 1: beam search (default: the transcriber's), ``length_norm``: rank hypotheses by their mean
-        log-probability (omnilingual-asr's option)."""
+        log-probability (omnilingual-asr's option). ``drafts``: per input the CTC argmax of each 20 ms frame (an
+        omniASR CTC model's, same tokenizer; default: the drafter's when there is one), which drafts the greedy
+        search (``spec``: the same tokens in fewer steps). Ignored by beam search."""
         langs = [None] * len(waves) if langs is None else list(langs)
         beams = self.beams if beams is None else beams
         length_norm = self.length_norm if length_norm is None else length_norm
-        rows = self.rows(waves, langs)
+        greedy = beams == 1 and not length_norm
+        if drafts is None and self.drafter is not None and greedy and mode == "fast" and self.draft_tokens:
+            with self.phase("drafter"):
+                drafts = self.drafter.frame_ids(waves)
+        rows = self.rows(waves, langs, drafts if greedy else None)
         if mode == "reference":
             self.encode_segments(rows)
             for r in rows:
@@ -255,10 +283,18 @@ class LLMTranscriber:
 
     def decoder(self, beams: int, length_norm: bool):
         """The fast decoder for this search (one per setting; the others' caches are released)."""
+        from . import kernels
         from .beam import BeamDecoder
         from .decode import GreedyDecoder
+        from .spec import SpecDecoder
 
-        if beams == 1 and not length_norm:
+        drafted = self.draft_tokens > 0 and kernels.available(self.device)
+        if drafted and beams == 1 and not length_norm:
+            decoder = getattr(self, "_spec_decoder", None)
+            if decoder is None:
+                decoder = self._spec_decoder = SpecDecoder(self.model, draft_tokens=self.draft_tokens,
+                                                           max_batch=self.max_batch, reserve=self.reserve)
+        elif beams == 1 and not length_norm:
             decoder = getattr(self, "_decoder", None)
             if decoder is None:
                 decoder = self._decoder = GreedyDecoder(self.model, max_batch=self.max_batch, reserve=self.reserve)
@@ -267,16 +303,20 @@ class LLMTranscriber:
             if decoder is None:
                 decoder = self._beam_decoders[beams, length_norm] = BeamDecoder(
                     self.model, beams=beams, length_norm=length_norm, max_batch=self.max_batch, reserve=self.reserve)
-        for other in [getattr(self, "_decoder", None), *self._beam_decoders.values()]:
+        for other in [getattr(self, "_decoder", None), getattr(self, "_spec_decoder", None),
+                      *self._beam_decoders.values()]:
             if other is not None and other is not decoder and (getattr(other, "capacity", 0)
                                                                or getattr(other, "ccap", 0)):
                 other.release()
         decoder.phase = self.phase
+        self.last_decoder = decoder
         return decoder
 
     def transcribe_rows(self, rows: list[Row], beams: int = 1, length_norm: bool = False) -> list[str]:
         """The fast decoder on encoded rows."""
         decoder = self.decoder(beams, length_norm)
+        if hasattr(decoder, "drafts"):
+            decoder.drafts = lambda j: rows[j].draft(len(rows[j].tokens))
 
         def start(j):
             with self.phase("context"):
@@ -291,8 +331,12 @@ class LLMTranscriber:
                 return self.context(r, len(r.tokens))
 
         # Each input's segments one after another (segment i is the context of i + 1); inputs share the slots.
-        with self.phase("decoder"):
-            decoder.decode_streams(len(rows), start, advance)
+        try:
+            with self.phase("decoder"):
+                decoder.decode_streams(len(rows), start, advance)
+        finally:
+            if hasattr(decoder, "drafts"):
+                decoder.drafts = lambda j: None  # the rows (their audio embeddings) are not kept after the call
         return [self.text(r) for r in rows]
 
 

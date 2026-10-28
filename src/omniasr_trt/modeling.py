@@ -200,7 +200,7 @@ class Encoder(nn.Module):
 
 
 class Wav2Vec2(nn.Module):
-    """The shared wav2vec2 encoder: normalised 16 kHz waves -> frame features ``[B, T, 2048]``."""
+    """The shared wav2vec2 encoder: normalised 16 kHz waves -> frame features ``[B, T, model_dim]``."""
 
     def __init__(self, cfg: EncoderConfig = EncoderConfig()):
         super().__init__()
@@ -425,8 +425,17 @@ def convert_state_dict(state: dict) -> dict:
     return state
 
 
-def load_checkpoint(model: nn.Module, path, dtype: torch.dtype, device="cuda") -> nn.Module:
-    """Official ``.pt`` (fp32, fairseq2 names) or a converted ``.safetensors`` -> ``model`` (strict)."""
+def encoder_config(state: dict) -> EncoderConfig:
+    """The encoder size of a checkpoint: omniASR's 300M / 1B / 3B / 7B encoders differ only in width, depth and FFN
+    size (all ``large_lv60k`` layers with 16 heads)."""
+    layers = 1 + max(int(k.split(".")[2]) for k in state if k.startswith("encoder.layers."))
+    return EncoderConfig(model_dim=state["encoder_frontend.model_dim_proj.weight"].shape[0], num_layers=layers,
+                         ffn_dim=state["encoder.layers.0.ffn.inner_proj.weight"].shape[0])
+
+
+def load_checkpoint(model: nn.Module | str, path, dtype: torch.dtype, device="cuda") -> nn.Module:
+    """Official ``.pt`` (fp32, fairseq2 names) or a converted ``.safetensors`` -> ``model`` (strict); ``model`` "ctc"
+    or "llm": built at the checkpoint's encoder size."""
     path = str(path)
     if path.endswith(".safetensors"):
         from safetensors.torch import load_file
@@ -434,6 +443,8 @@ def load_checkpoint(model: nn.Module, path, dtype: torch.dtype, device="cuda") -
         state = load_file(path, device="cpu")
     else:
         state = convert_state_dict(torch.load(path, map_location="cpu", mmap=True, weights_only=True))
+    if isinstance(model, str):
+        model = build(model, enc_cfg=encoder_config(state))
     model.load_state_dict(state, strict=True, assign=True)
     model = model.to(device=device, dtype=dtype).eval()
     if isinstance(model, LLMModel):  # .to(dtype) cast the fp32 rotation table
@@ -450,9 +461,9 @@ def convert(src, dst, dtype: torch.dtype = torch.bfloat16) -> None:
     save_file({k: v.to(dtype).contiguous() for k, v in state.items()}, str(dst))
 
 
-def build(kind: str, meta: bool = True) -> nn.Module:
+def build(kind: str, meta: bool = True, enc_cfg: EncoderConfig = EncoderConfig()) -> nn.Module:
     with torch.device("meta") if meta else torch.device("cpu"):
-        model = CTCModel() if kind == "ctc" else LLMModel()
+        model = CTCModel(enc_cfg) if kind == "ctc" else LLMModel(enc_cfg)
     if meta and kind == "llm":  # non-persistent buffer: recompute on the CPU
         model.rope = rope_table(model.dec_cfg)
     return model

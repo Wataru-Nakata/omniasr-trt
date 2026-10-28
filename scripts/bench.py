@@ -41,9 +41,13 @@ def main():
     p.add_argument("--manifest", type=Path, required=True)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--batch", type=int, default=8, help="inputs per call")
+    p.add_argument("--max-batch", type=int, help="LLM decoder slots (default: --batch); a call of more inputs keeps "
+                   "them full")
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--beam-size", type=int, default=1, help="LLM: omnilingual-asr's beam search (1: greedy)")
     p.add_argument("--length-norm", action="store_true")
+    p.add_argument("--draft-tokens", type=int, default=4, help="LLM greedy: tokens proposed per step (0: one)")
+    p.add_argument("--drafter", help="LLM greedy: a CTC checkpoint whose transcript drafts the decoder")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     from omniasr_trt import OmniASRCTC, OmniASRLLM
@@ -55,8 +59,10 @@ def main():
     dtype = getattr(torch, args.dtype)
     t0 = time.monotonic()
     if args.model == "llm":
-        model = OmniASRLLM.from_pretrained(args.weights, args.tokenizer, dtype=dtype, max_batch=args.batch,
-                                           beam_size=args.beam_size, length_norm=args.length_norm)
+        model = OmniASRLLM.from_pretrained(args.weights, args.tokenizer, dtype=dtype,
+                                           max_batch=args.max_batch or args.batch, beam_size=args.beam_size,
+                                           length_norm=args.length_norm, drafter=args.drafter,
+                                           draft_tokens=args.draft_tokens)
     else:
         model = OmniASRCTC.from_pretrained(args.weights, args.tokenizer, dtype=dtype)
     load = time.monotonic() - t0
@@ -82,7 +88,8 @@ def main():
                        "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30})
         print(json.dumps(passes[-1]), flush=True)
     result = {"impl": "omniasr-trt", "model": args.model, "dtype": args.dtype, "batch": args.batch,
-              "beam_size": args.beam_size, "length_norm": args.length_norm,
+              "max_batch": args.max_batch or args.batch, "beam_size": args.beam_size, "length_norm": args.length_norm,
+              "draft_tokens": args.draft_tokens, "drafter": args.drafter,
               "inputs": len(waves), "audio_seconds": seconds, "load_seconds": load, "passes": passes,
               "ids": [it.get("id", it["audio"]) for it in items], "texts": texts}
     args.out.write_text(json.dumps(result, ensure_ascii=False))

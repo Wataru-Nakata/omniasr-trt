@@ -3,7 +3,8 @@
 * :class:`Pipeline` -- omnilingual-asr's ``ASRInferencePipeline.transcribe(inp, lang=..., batch_size=...)`` for the
   LLM Unlimited model, with a ``streaming_config`` (``is_streaming``, ``segment_secs``) as callers read it and its
   ``beam_search_config`` (``nbest``, ``length_norm``). Mixed language ids and ``None`` may share one call
-  (omnilingual-asr 0.2.0 needs two).
+  (omnilingual-asr 0.2.0 needs two). ``batch_size`` is accepted and not needed: the inputs of a call (up to an
+  hour of audio at a time) share the model's ``max_batch`` decoder slots.
 * :class:`CTC` -- ``forward(pieces)`` -> per piece logits ``[F, V]`` (bf16, GPU) of 16 kHz waveforms, each
   normalised on its own and batched by padded length, for code that windows and stitches emissions itself.
 * :class:`TokenizerShim` -- ``create_encoder()`` / ``create_decoder(skip_special_tokens=...)`` / ``vocab_info``
@@ -19,6 +20,9 @@ import torch
 
 from . import OmniASRCTC, OmniASRLLM
 from .tokenizer import Tokenizer
+
+
+CALL_SAMPLES = 3600 * 16000  # audio decoded in one call by Pipeline.transcribe
 
 
 @dataclass(frozen=True)
@@ -57,10 +61,17 @@ class Pipeline:
             waves.append(wave.mean(axis=0) if wave.ndim == 2 and wave.shape[0] < wave.shape[1] else
                          wave.mean(axis=1) if wave.ndim == 2 else wave)
         langs = list(lang) if lang else [None] * len(waves)
-        texts = []
-        for k in range(0, len(waves), batch_size):  # omnilingual-asr's buckets, in the given order
-            texts += self.model.transcribe(waves[k : k + batch_size], langs[k : k + batch_size],
-                                           beam_size=self.beams, length_norm=self.length_norm)
+        # Not in calls of ``batch_size``: one call decodes all its inputs in the model's ``max_batch`` slots, a slot
+        # whose input is finished taking the next one; an hour of audio per call bounds the memory.
+        texts, k = [], 0
+        while k < len(waves):
+            n, samples = 1, len(waves[k])
+            while k + n < len(waves) and samples + len(waves[k + n]) <= CALL_SAMPLES:
+                samples += len(waves[k + n])
+                n += 1
+            texts += self.model.transcribe(waves[k : k + n], langs[k : k + n], beam_size=self.beams,
+                                           length_norm=self.length_norm)
+            k += n
         return texts
 
 

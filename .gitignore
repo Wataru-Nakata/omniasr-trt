@@ -1,0 +1,10 @@
+.venv/
+.cache/
+__pycache__/
+*.egg-info/
+dist/
+build/
+outputs/
+*.onnx
+*.onnx.data
+*.engine

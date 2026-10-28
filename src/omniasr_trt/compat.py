@@ -1,8 +1,9 @@
 """Drop-in pieces for code written against omnilingual-asr / fairseq2.
 
 * :class:`Pipeline` -- omnilingual-asr's ``ASRInferencePipeline.transcribe(inp, lang=..., batch_size=...)`` for the
-  LLM Unlimited model, with a ``streaming_config`` (``is_streaming``, ``segment_secs``) as callers read it. Mixed
-  language ids and ``None`` may share one call (omnilingual-asr 0.2.0 needs two).
+  LLM Unlimited model, with a ``streaming_config`` (``is_streaming``, ``segment_secs``) as callers read it and its
+  ``beam_search_config`` (``nbest``, ``length_norm``). Mixed language ids and ``None`` may share one call
+  (omnilingual-asr 0.2.0 needs two).
 * :class:`CTC` -- ``forward(pieces)`` -> per piece logits ``[F, V]`` (bf16, GPU) of 16 kHz waveforms, each
   normalised on its own and batched by padded length, for code that windows and stitches emissions itself.
 * :class:`TokenizerShim` -- ``create_encoder()`` / ``create_decoder(skip_special_tokens=...)`` / ``vocab_info``
@@ -27,14 +28,24 @@ class StreamingConfig:
     sample_rate: int = 16000
 
 
+def search_settings(config) -> tuple[int, bool]:
+    """``nbest`` / ``length_norm`` of an omnilingual-asr ``Wav2Vec2LlamaBeamSearchConfig`` (or a dict); None:
+    omnilingual-asr's pipeline default, one hypothesis."""
+    if config is None:
+        return 1, False
+    get = config.get if isinstance(config, dict) else lambda k, d: getattr(config, k, d)
+    return int(get("nbest", 1)), bool(get("length_norm", False))
+
+
 class Pipeline:
-    def __init__(self, model: OmniASRLLM):
+    def __init__(self, model: OmniASRLLM, beam_search_config=None):
         self.model = model
         self.streaming_config = StreamingConfig()
+        self.beams, self.length_norm = search_settings(beam_search_config)
 
     @classmethod
-    def from_pretrained(cls, checkpoint, tokenizer=None, **options) -> "Pipeline":
-        return cls(OmniASRLLM.from_pretrained(checkpoint, tokenizer, **options))
+    def from_pretrained(cls, checkpoint, tokenizer=None, beam_search_config=None, **options) -> "Pipeline":
+        return cls(OmniASRLLM.from_pretrained(checkpoint, tokenizer, **options), beam_search_config)
 
     @torch.inference_mode()
     def transcribe(self, inp, *, lang=None, batch_size: int = 8) -> list[str]:
@@ -48,7 +59,8 @@ class Pipeline:
         langs = list(lang) if lang else [None] * len(waves)
         texts = []
         for k in range(0, len(waves), batch_size):  # omnilingual-asr's buckets, in the given order
-            texts += self.model.transcribe(waves[k : k + batch_size], langs[k : k + batch_size])
+            texts += self.model.transcribe(waves[k : k + batch_size], langs[k : k + batch_size],
+                                           beam_size=self.beams, length_norm=self.length_norm)
         return texts
 
 

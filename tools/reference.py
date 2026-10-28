@@ -5,10 +5,11 @@ Needs omnilingual-asr and fairseq2 (not dependencies of omniasr-trt), e.g. ``pip
     python tools/reference.py --card omniASR_LLM_Unlimited_7B_v2 --checkpoint omniASR-LLM-Unlimited-7B-v2.pt \\
         --tokenizer omniASR_tokenizer_written_v2.model --manifest data.jsonl --batch 8 --out ref-llm.json
 
-Greedy search (``nbest=1``, as omnilingual-asr's default), inputs longest first in calls of ``--batch``, the tail
-padding of ``scripts/bench.py``; conditioned and unconditioned inputs go to separate ``transcribe`` calls (0.2.0
-cannot mix them). With ``--dtype float32`` this is the agreement reference of the README. The CTC card takes
-inputs up to 40 s only (omnilingual-asr's limit; ``scripts/bench.py ctc`` windows longer ones).
+Greedy search by default (``nbest=1``, as omnilingual-asr's pipeline; ``--nbest`` for its beam search), inputs
+longest first in calls of ``--batch``, the tail padding of ``scripts/bench.py``; conditioned and unconditioned
+inputs go to separate ``transcribe`` calls (0.2.0 cannot mix them). With ``--dtype float32`` this is the agreement
+reference of the README. The CTC card takes inputs up to 40 s only (omnilingual-asr's limit; ``scripts/bench.py
+ctc`` windows longer ones).
 """
 
 import argparse
@@ -49,6 +50,8 @@ def main():
     p.add_argument("--manifest", type=Path, required=True)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--nbest", type=int, default=1, help="beam size (1: greedy, the pipeline's default)")
+    p.add_argument("--length-norm", action="store_true")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     from omnilingual_asr.models.inference.pipeline import ASRInferencePipeline
@@ -66,7 +69,8 @@ def main():
     model, tok = load(args.card, args.checkpoint, args.tokenizer, dtype)
     load_seconds = time.monotonic() - t0
     pipe = ASRInferencePipeline(None, model=model, tokenizer=tok, dtype=dtype,
-                                beam_search_config=Wav2Vec2LlamaBeamSearchConfig(nbest=1, length_norm=False))
+                                beam_search_config=Wav2Vec2LlamaBeamSearchConfig(nbest=args.nbest,
+                                                                                 length_norm=args.length_norm))
     ctc = "CTC" in args.card
     order = sorted(range(len(waves)), key=lambda i: -len(waves[i]))
     texts = [None] * len(waves)
@@ -87,6 +91,7 @@ def main():
     wall = time.monotonic() - started
     seconds = sum(len(w) for w in waves) / 16000
     result = {"impl": "omnilingual-asr", "card": args.card, "dtype": args.dtype, "batch": args.batch,
+              "nbest": args.nbest, "length_norm": args.length_norm,
               "inputs": len(waves), "audio_seconds": seconds, "load_seconds": load_seconds,
               "passes": [{"wall_seconds": wall, "rtfx": seconds / wall,
                           "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30}],

@@ -76,6 +76,7 @@ def test_cache_grows_then_shrinks():
     m = small_model(seed=5)
     t = LLMTranscriber(m, FakeTokenizer(), max_batch=3)
     dec = GreedyDecoder(m, max_batch=3, sync_every=5, graphs=False, reserve=1)
+    dec.context_floor = 0  # no head room: let the generation outgrow the first allocation
     torch.manual_seed(6)
     # Contexts just under the first allocation (one 256-key bucket): a few generated tokens make the cache grow.
     ctxs = [torch.randn(n, 32, dtype=torch.float64) for n in (250, 251, 252)]

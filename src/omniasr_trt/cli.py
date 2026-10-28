@@ -45,6 +45,8 @@ def main():
     t.add_argument("--ctc", action="store_true", help="the CTC model (greedy); default: the LLM model")
     t.add_argument("--lang", help="omnilingual language id, e.g. eng_Latn (LLM only; default: unconditioned)")
     t.add_argument("--batch-size", type=int, default=8)
+    t.add_argument("--beam-size", type=int, default=1, help="LLM: omnilingual-asr's beam search (1: greedy)")
+    t.add_argument("--length-norm", action="store_true", help="LLM beam search: rank by mean log-probability")
     t.add_argument("--dtype", default="bfloat16")
     t.add_argument("--json", action="store_true")
     args = p.parse_args()
@@ -64,7 +66,8 @@ def main():
     else:
         from . import OmniASRLLM
 
-        model = OmniASRLLM.from_pretrained(args.model, args.tokenizer, dtype=dtype, max_batch=args.batch_size)
+        model = OmniASRLLM.from_pretrained(args.model, args.tokenizer, dtype=dtype, max_batch=args.batch_size,
+                                           beam_size=args.beam_size, length_norm=args.length_norm)
         texts = []
         for k in range(0, len(waves), args.batch_size):
             chunk = waves[k : k + args.batch_size]

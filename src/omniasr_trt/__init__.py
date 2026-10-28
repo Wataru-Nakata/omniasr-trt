@@ -27,17 +27,18 @@ class OmniASRLLM:
 
     @classmethod
     def from_pretrained(cls, checkpoint, tokenizer=None, *, dtype=torch.bfloat16, device="cuda", max_batch=8,
-                        **options):
+                        beam_size=1, length_norm=False, **options):
         from .llm import LLMTranscriber
         from .modeling import build, load_checkpoint
         from .tokenizer import Tokenizer
 
         model = load_checkpoint(build("llm"), checkpoint, dtype, device)
         return cls(LLMTranscriber(model, Tokenizer(_tokenizer_path(checkpoint, tokenizer)), max_batch=max_batch,
-                                  **options))
+                                  beams=beam_size, length_norm=length_norm, **options))
 
-    def transcribe(self, waves, langs=None, *, mode="fast"):
-        return self.transcriber.transcribe(waves, langs, mode=mode)
+    def transcribe(self, waves, langs=None, *, mode="fast", beam_size=None, length_norm=None):
+        """``beam_size`` > 1: omnilingual-asr's beam search (default: ``from_pretrained(beam_size=...)``, else 1)."""
+        return self.transcriber.transcribe(waves, langs, mode=mode, beams=beam_size, length_norm=length_norm)
 
 
 class OmniASRCTC:

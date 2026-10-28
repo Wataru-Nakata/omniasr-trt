@@ -1,8 +1,8 @@
 # omniasr-trt
 
 Fast inference for Meta's [Omnilingual ASR](https://github.com/facebookresearch/omnilingual-asr) 7B models:
-`omniASR_LLM_Unlimited_7B_v2` (transcripts of inputs of any length, greedy) and `omniASR_CTC_7B_v2` (CTC
-emissions, e.g. for forced alignment, and greedy transcripts). Plain PyTorch with a few Triton kernels and CUDA
+`omniASR_LLM_Unlimited_7B_v2` (transcripts of inputs of any length, greedy or beam search) and `omniASR_CTC_7B_v2`
+(CTC emissions, e.g. for forced alignment, and greedy transcripts). Plain PyTorch with a few Triton kernels and CUDA
 graphs; no fairseq2 or omnilingual-asr dependency. The official checkpoints load with `strict=True` (only the
 positional convolution's weight norm is folded).
 
@@ -37,6 +37,7 @@ from omniasr_trt import OmniASRCTC, OmniASRLLM
 
 llm = OmniASRLLM.from_pretrained("llm-bf16.safetensors", "omniASR_tokenizer_written_v2.model")
 llm.transcribe([wave_a, wave_b], langs=["ben_Beng", None])   # 16 kHz mono float32, any length; None: unconditioned
+llm.transcribe([wave_a], langs=["ben_Beng"], beam_size=5)     # beam search (also: from_pretrained(beam_size=5))
 
 ctc = OmniASRCTC.from_pretrained("ctc-bf16.safetensors", "omniASR_tokenizer_written_v2.model")
 frames, windows = ctc.emissions([wave])   # logits [T, 10288] per input (bf16, GPU), 20 ms frames
@@ -45,17 +46,21 @@ ctc.transcribe([wave])                    # greedy text
 
 ```bash
 omniasr-trt transcribe --model llm-bf16.safetensors --lang ben_Beng speech.wav
+omniasr-trt transcribe --model llm-bf16.safetensors --lang ben_Beng --beam-size 5 speech.wav
 omniasr-trt transcribe --ctc --model ctc-bf16.safetensors speech.wav
 ```
 
 * LLM: inputs are cut into 15 s segments and segment i is decoded with segment i-1's audio and text as context, as
   omnilingual-asr's streaming pipeline does; language ids are omnilingual-asr's (`eng_Latn`, `ben_Beng`, ...).
-  `max_batch` (default 8) is the number of inputs decoded at once.
+  `max_batch` (default 8) is the number of inputs decoded at once. `beam_size` > 1 runs omnilingual-asr's beam
+  search (`length_norm=True`: rank hypotheses by their mean log-probability, its option), as it behaves for a
+  single input; see [Beam search](#beam-search) for what batching does to it in omnilingual-asr.
 * CTC: inputs up to `max_single_seconds` (30) in one pass, longer ones in `window_seconds` (20) windows with
   `context_seconds` (5) on both sides whose centre frames are stitched; each piece is normalised on its own.
 * `omniasr_trt.compat` has drop-ins for code written against omnilingual-asr / fairseq2: `Pipeline`
-  (`ASRInferencePipeline.transcribe(inp, lang=..., batch_size=...)`), `CTC` (`forward(pieces)` -> logits per
-  piece) and a fairseq2-style tokenizer (`create_encoder`, `create_decoder`, `vocab_info`).
+  (`ASRInferencePipeline.transcribe(inp, lang=..., batch_size=...)`, with its `beam_search_config`), `CTC`
+  (`forward(pieces)` -> logits per piece) and a fairseq2-style tokenizer (`create_encoder`, `create_decoder`,
+  `vocab_info`).
 
 ## Speed
 
@@ -73,9 +78,11 @@ omniASR-LLM (the llm set):
 |---|---:|---:|---:|---:|
 | omnilingual-asr 0.2.0 | 4 | 16.2 | 18.6 GiB | ~450 s (fp32 `.pt` from network storage) |
 | omnilingual-asr 0.2.0 | 8 | 18.5 | 22.6 GiB | |
-| **omniasr-trt** | 8 | **152** | 23.7 GiB | 10-24 s (bf16 `.safetensors`) |
+| **omniasr-trt** | 8 | **152** | 22.8 GiB | 10-24 s (bf16 `.safetensors`) |
+| **omniasr-trt**, beam 5 | 8 | **129** | 25.8 GiB | |
 
-8.2x at batch 8 (151-155 over repeated runs; the second pass over the data is as fast as the first).
+8.2x at batch 8 (151-155 over repeated runs; the second pass over the data is as fast as the first). Beam search
+with 5 hypotheses costs 16% more than greedy decoding here; omnilingual-asr's own beam search is compared below.
 
 omniASR-CTC emissions (20 s windows with 5 s context, 320 s of audio per forward, 4 inputs per call):
 
@@ -86,6 +93,43 @@ omniASR-CTC emissions (20 s windows with 5 s context, 320 s of audio per forward
 
 The CTC model is the 7B encoder only, and its GEMMs (65% of the time, ~640 TFLOPS) are the same cuBLAS calls as
 fairseq2's, so the gains are small: attention without padding masks and the load time.
+
+## Beam search
+
+`beam_size=5` is the setting of the omnilingual-asr paper (`Wav2Vec2LlamaBeamSearchConfig(nbest=5)`); the search
+rules are omnilingual-asr's: every step each hypothesis offers `score + log p` (with `length_norm`, the running mean),
+a finished one only EOS at its frozen score, the best 5 offers survive, the repetition stop freezes a hypothesis at
+the step it fires, and the text is the best hypothesis's when all have finished. Here this is what happens for every
+input, whatever the batch.
+
+In omnilingual-asr 0.2.0 it is what happens at batch 1 only. A batch is prefilled up to its shortest context and the
+longer contexts are fed one token per step; during that phase every hypothesis of those inputs has its score reset
+to 0, so their 5 hypotheses start identical and stay identical: each segment of every input whose context is longer
+than the batch's shortest is decoded greedily. Measured in fp32 on the 25 llm inputs up to 15 s (one segment each;
+4 calls of up to 8): in every call exactly the shortest input got its batch-1 beam-search text, 15 of the other 21
+got their greedy text and 6 texts on which beam search and greedy agree. Longer inputs mix beam-searched and greedy
+segments.
+
+The 92 llm inputs up to 90 s (39 min):
+
+| implementation | batch | RTFx |
+|---|---:|---:|
+| omnilingual-asr 0.2.0, beam 5 | 1 | 7.85 |
+| omnilingual-asr 0.2.0, beam 5 (mostly greedy, as above) | 8 | 13.3 |
+| **omniasr-trt, beam 5** | 8 | **121** (132 on a second pass) |
+
+| comparison (same 92 inputs) | identical texts | character edit rate |
+|---|---:|---:|
+| fp32, batch 1: omniasr-trt vs omnilingual-asr (fast path and reference order) | 92/92 | 0% |
+| bf16: omniasr-trt batch 8 vs omnilingual-asr batch 1 | 65/92 | 3.6% |
+| bf16: omnilingual-asr batch 8 vs omnilingual-asr batch 1 | 27/92 | 10.5% |
+| bf16, omnilingual-asr batch 1: beam 5 vs greedy | 17/92 | 19.3% |
+
+How: the context (~1,750 tokens) is prefilled once per input and its K/V shared by the 5 hypotheses; the K/V of
+each generated token is written once and hypotheses follow parent pointers (a reorder gathers int32 indices, not
+K/V); one Triton kernel reads an input's context once for all 5 queries, another each hypothesis's generated keys
+through its pointers. One step, including the top-5 over 5 x 10288 candidates per input, is one CUDA graph; the host
+steps in exactly at the step a repetition check is due.
 
 ## How
 
@@ -157,7 +201,8 @@ and `scripts/compare.py` on a JSONL manifest of `{"id", "audio", "lang"}`.
 ## Layout
 
 * `src/omniasr_trt/modeling.py` -- encoder, CTC head, LLaMA decoder; checkpoint loading and conversion
-* `src/omniasr_trt/llm.py` -- streaming syntax and the reference-order greedy loop; `decode.py` -- the fast decoder
+* `src/omniasr_trt/llm.py` -- streaming syntax and the reference-order greedy and beam loops; `decode.py` -- the
+  fast greedy decoder; `beam.py` -- the fast beam search
 * `src/omniasr_trt/kernels.py` -- Triton kernels; `ctc.py` -- windowed CTC emissions; `compat.py` -- drop-ins
 * `scripts/` -- benchmarks and kernel tuning; `tools/reference.py` -- omnilingual-asr runner (never imported)
 * `tests/` -- `pytest` (the decoder against the reference-order loop on small random models, kernels on CUDA)

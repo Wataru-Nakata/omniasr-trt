@@ -42,6 +42,8 @@ def main():
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--batch", type=int, default=8, help="inputs per call")
     p.add_argument("--repeat", type=int, default=1)
+    p.add_argument("--beam-size", type=int, default=1, help="LLM: omnilingual-asr's beam search (1: greedy)")
+    p.add_argument("--length-norm", action="store_true")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     from omniasr_trt import OmniASRCTC, OmniASRLLM
@@ -53,7 +55,8 @@ def main():
     dtype = getattr(torch, args.dtype)
     t0 = time.monotonic()
     if args.model == "llm":
-        model = OmniASRLLM.from_pretrained(args.weights, args.tokenizer, dtype=dtype, max_batch=args.batch)
+        model = OmniASRLLM.from_pretrained(args.weights, args.tokenizer, dtype=dtype, max_batch=args.batch,
+                                           beam_size=args.beam_size, length_norm=args.length_norm)
     else:
         model = OmniASRCTC.from_pretrained(args.weights, args.tokenizer, dtype=dtype)
     load = time.monotonic() - t0
@@ -79,6 +82,7 @@ def main():
                        "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30})
         print(json.dumps(passes[-1]), flush=True)
     result = {"impl": "omniasr-trt", "model": args.model, "dtype": args.dtype, "batch": args.batch,
+              "beam_size": args.beam_size, "length_norm": args.length_norm,
               "inputs": len(waves), "audio_seconds": seconds, "load_seconds": load, "passes": passes,
               "ids": [it.get("id", it["audio"]) for it in items], "texts": texts}
     args.out.write_text(json.dumps(result, ensure_ascii=False))

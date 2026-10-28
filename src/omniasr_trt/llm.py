@@ -72,7 +72,7 @@ class Row:
 
 class LLMTranscriber:
     def __init__(self, model: LLMModel, tokenizer, *, max_batch: int = 8, encoder_batch_seconds: float = 240.0,
-                 reserve: int = 512):
+                 reserve: int = 512, beams: int = 1, length_norm: bool = False):
         self.model = model
         self.tok = tokenizer
         self.langs = lang_table()
@@ -81,6 +81,8 @@ class LLMTranscriber:
         self.max_batch = max_batch
         self.encoder_batch = int(encoder_batch_seconds * 16000)
         self.reserve = reserve  # decoder KV positions beyond the longest context (grows on demand)
+        self.beams, self.length_norm = beams, length_norm  # search defaults (1: greedy)
+        self._beam_decoders: dict = {}
         v = model.dec_cfg.vocab_size
         self.lid, self.last_seg, self.regular_seg = v, v + 1, v + 2
         self.profile = False  # synchronised wall time per phase in ``timings``
@@ -178,31 +180,103 @@ class LLMTranscriber:
             t += 1
         return [int(v) for v in out[c - 1 : t + 1] if v not in (PAD, BOS, EOS)]
 
+    @torch.inference_mode()
+    def beam_reference(self, ctx: Tensor, beams: int, length_norm: bool = False) -> list[int]:
+        """omnilingual-asr's beam search for one input (its batch-1 behaviour), in its order of computation.
+
+        ``beams`` rows; at the first step only row 0 is live (the others score -1e6); every step each row offers
+        ``score + log p`` (``length_norm``: the running mean, chosen by row 0's token count), a finished row only
+        EOS at its frozen score; the best ``beams`` of all rows' offers survive (``topk``, sorted) and the cache
+        follows their parents. The text is row 0's after the last step.
+        """
+        m = self.model
+        c, n = ctx.size(0), beams
+        cache = [None] * len(m.llama_decoder.layers)
+        m.decoder_forward(ctx[None, : c - 1].expand(n, -1, -1), torch.arange(c - 1, device=self.device), cache)
+        out = torch.full((n, MAX_GEN), PAD, dtype=torch.int32, device=self.device)
+        scores = torch.full((n,), -1e6, dtype=torch.float32, device=self.device)
+        scores[0] = 0.0
+        ended = torch.zeros(n, dtype=torch.bool, device=self.device)
+        x = ctx[c - 1].expand(n, -1)
+        t = c - 1
+        while True:
+            h = m.decoder_forward(x[:, None], torch.tensor([t], device=self.device), cache)
+            logp = F.log_softmax(m.final_proj(h[:, 0]), dim=-1)  # [n, V], model dtype
+            if length_norm:
+                count = ((out[:, :t] != PAD) & (out[:, :t] != EOS)).sum(1, keepdim=True)
+                cand = (scores[:, None] * count + logp) / (count + 1) if count[0, 0] > 0 else scores[:, None] + logp
+            else:
+                cand = scores[:, None] + logp
+            cand[ended] = float("-inf")
+            cand[ended, EOS] = scores[ended].to(cand.dtype)
+            top, pick = cand.view(1, -1).topk(n, sorted=True)
+            parent, token = pick[0] // cand.size(1), pick[0] % cand.size(1)
+            out, ended, scores = out[parent], ended[parent], scores[parent]
+            for kv in cache:
+                kv[0], kv[1] = kv[0].index_select(0, parent), kv[1].index_select(0, parent)
+            scores = torch.where(ended, scores, top[0])
+            out[:, t] = token.to(torch.int32)
+            out[ended, t] = EOS
+            ended = out[:, t] == EOS
+            if t % CHECK_EVERY == 0 and t > c + CHECK_WINDOW:
+                window = out[:, t - CHECK_WINDOW : t].cpu().numpy()
+                stop = torch.tensor([compression_ratio(row) > CHECK_RATIO for row in window], device=self.device)
+                ended |= stop
+            if bool(ended.all()) or t == MAX_GEN - 4:
+                break
+            x = m.text_frontend.weight[out[:, t].long()].to(self.dtype)
+            t += 1
+        return [int(v) for v in out[0, c - 1 : t + 1].tolist() if v not in (PAD, BOS, EOS)]
+
     # ------------------------------------------------------------------ public
 
     @torch.inference_mode()
-    def transcribe(self, waves, langs=None, *, mode: str = "fast") -> list[str]:
-        """Texts of 16 kHz mono waves (any length; a last segment needs >= 400 samples, as the reference)."""
+    def transcribe(self, waves, langs=None, *, mode: str = "fast", beams: int | None = None,
+                   length_norm: bool | None = None) -> list[str]:
+        """Texts of 16 kHz mono waves (any length; a last segment needs >= 400 samples, as the reference).
+
+        ``beams`` > 1: beam search (default: the transcriber's), ``length_norm``: rank hypotheses by their mean
+        log-probability (omnilingual-asr's option)."""
         langs = [None] * len(waves) if langs is None else list(langs)
+        beams = self.beams if beams is None else beams
+        length_norm = self.length_norm if length_norm is None else length_norm
         rows = self.rows(waves, langs)
         if mode == "reference":
             self.encode_segments(rows)
             for r in rows:
                 for i in range(r.segments):
-                    r.tokens.append(self.greedy_reference(self.context(r, i)))
+                    ctx = self.context(r, i)
+                    r.tokens.append(self.greedy_reference(ctx) if beams == 1 and not length_norm else
+                                    self.beam_reference(ctx, beams, length_norm))
             return [self.text(r) for r in rows]
         with self.phase("encoder"):
             self.encode_segments(rows)
-        return self.transcribe_rows(rows)
+        return self.transcribe_rows(rows, beams, length_norm)
 
-    def transcribe_rows(self, rows: list[Row]) -> list[str]:
-        """The fast decoder on encoded rows."""
+    def decoder(self, beams: int, length_norm: bool):
+        """The fast decoder for this search (one per setting; the others' caches are released)."""
+        from .beam import BeamDecoder
         from .decode import GreedyDecoder
 
-        decoder = getattr(self, "_decoder", None)
-        if decoder is None:
-            decoder = self._decoder = GreedyDecoder(self.model, max_batch=self.max_batch, reserve=self.reserve)
+        if beams == 1 and not length_norm:
+            decoder = getattr(self, "_decoder", None)
+            if decoder is None:
+                decoder = self._decoder = GreedyDecoder(self.model, max_batch=self.max_batch, reserve=self.reserve)
+        else:
+            decoder = self._beam_decoders.get((beams, length_norm))
+            if decoder is None:
+                decoder = self._beam_decoders[beams, length_norm] = BeamDecoder(
+                    self.model, beams=beams, length_norm=length_norm, max_batch=self.max_batch, reserve=self.reserve)
+        for other in [getattr(self, "_decoder", None), *self._beam_decoders.values()]:
+            if other is not None and other is not decoder and (getattr(other, "capacity", 0)
+                                                               or getattr(other, "ccap", 0)):
+                other.release()
         decoder.phase = self.phase
+        return decoder
+
+    def transcribe_rows(self, rows: list[Row], beams: int = 1, length_norm: bool = False) -> list[str]:
+        """The fast decoder on encoded rows."""
+        decoder = self.decoder(beams, length_norm)
 
         def start(j):
             with self.phase("context"):

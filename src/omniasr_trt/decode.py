@@ -25,6 +25,10 @@ from .modeling import LLMModel, apply_rope
 
 KEY_BUCKET = 256
 LIMIT = MAX_GEN - 4  # the reference stops after generating from this position
+# A streaming context holds two segments of audio (2 x 749 frames), the previous segment's text and 7 markers; the
+# caches start that large so that the contexts after the first segment do not grow them (and the CUDA graphs captured
+# on them) in every call: a 15 s segment's text is rarely longer than 400 characters.
+CONTEXT_FLOOR = 2048
 
 
 def fuse_projections(model: LLMModel) -> list[tuple[Tensor, Tensor, Tensor, Tensor]]:
@@ -70,6 +74,7 @@ class GreedyDecoder:
             self.pool = torch.cuda.graph_pool_handle()
             self.capture_stream = torch.cuda.Stream(self.device)
         self.reserve = reserve  # generated positions beyond the longest context before the cache grows
+        self.context_floor = CONTEXT_FLOOR
         self.capacity = 0
         self.graphs: dict = {}
         self.stats = {"steps": 0, "rows_steps": 0, "prefill_tokens": 0, "captures": 0, "grows": 0}
@@ -126,6 +131,11 @@ class GreedyDecoder:
 
     def prefill(self, ctx: list[Tensor], slots: list[int] | None = None) -> Tensor:
         """Fill cache rows ``slots`` (default 0..B-1) with the contexts; returns each one's first token [B]."""
+        return self.prefill_into(ctx, slots, self.k, self.v).argmax(-1)
+
+    def prefill_into(self, ctx: list[Tensor], slots, k_cache: Tensor, v_cache: Tensor) -> Tensor:
+        """Contexts into rows ``slots`` of ``k_cache`` / ``v_cache`` ([layers, rows, H, S, Dh]); returns the
+        log-softmax after each context's last token [B, V] (model dtype)."""
         m, b = self.m, len(ctx)
         lens = [c.size(0) for c in ctx]
         width = max(lens)
@@ -142,21 +152,21 @@ class GreedyDecoder:
             qkv_w, out_w, gi_w, ffo_w = self.layers[i]
             qkv = layer.self_attn_layer_norm(h) @ qkv_w.t()  # [B*W, 3*H*Dh]
             if self.fused_prefill:  # q rotated; k, v rotated / written straight into the cache rows
-                q = kernels.rope_kv(qkv, m.rope, pos, self.k[i], self.v[i], self.heads, slot)
+                q = kernels.rope_kv(qkv, m.rope, pos, k_cache[i], v_cache[i], self.heads, slot)
                 q = q.view(b, width, self.heads, -1).transpose(1, 2)
-                k = self.k[i, :b, :, :width] if rows is None else self.k[i, rows, :, :width]
-                v = self.v[i, :b, :, :width] if rows is None else self.v[i, rows, :, :width]
+                k = k_cache[i, :b, :, :width] if rows is None else k_cache[i, rows, :, :width]
+                v = v_cache[i, :b, :, :width] if rows is None else v_cache[i, rows, :, :width]
             else:
                 q, k, v = qkv.view(b, width, 3, self.heads, self.head_dim).unbind(2)
                 q = apply_rope(q, cs).transpose(1, 2)
                 k = apply_rope(k, cs).transpose(1, 2)
                 v = v.transpose(1, 2)
                 if rows is None:
-                    self.k[i, :b, :, :width] = k
-                    self.v[i, :b, :, :width] = v
+                    k_cache[i, :b, :, :width] = k
+                    v_cache[i, :b, :, :width] = v
                 else:
-                    self.k[i, rows, :, :width] = k
-                    self.v[i, rows, :, :width] = v
+                    k_cache[i, rows, :, :width] = k
+                    v_cache[i, rows, :, :width] = v
             o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             h = torch.addmm(h, o.transpose(1, 2).reshape(b * width, -1), out_w.t())
             gate, inner = (layer.ffn_layer_norm(h) @ gi_w.t()).chunk(2, -1)
@@ -165,7 +175,7 @@ class GreedyDecoder:
         last = h[torch.arange(b, device=self.device), torch.tensor(lens, device=self.device) - 1]
         logits = m.final_proj(m.llama_decoder.layer_norm(last))
         self.stats["prefill_tokens"] += sum(lens)
-        return F.log_softmax(logits, dim=-1).argmax(-1)
+        return F.log_softmax(logits, dim=-1)
 
     # ------------------------------------------------------------------ one decode step
 
@@ -275,7 +285,8 @@ class GreedyDecoder:
             nonlocal normal
             longest = max(c.size(0) for _, _, c in pairs)
             in_flight = [int(self.last[s]) for s in range(b) if stream[s] >= 0 and s not in {p[0] for p in pairs}]
-            self.ensure_capacity(max([longest + self.reserve] + [p + self.sync_every + 2 for p in in_flight]))
+            self.ensure_capacity(max([max(longest, self.context_floor) + self.reserve] +
+                                     [p + self.sync_every + 2 for p in in_flight]))
             normal = normal or self.capacity
             slots = [s for s, _, _ in pairs]
             with self.phase("prefill"):
